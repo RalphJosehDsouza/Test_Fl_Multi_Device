@@ -193,23 +193,22 @@ def main(grid: Grid, context: Context) -> None:
 
                 messages = []
                 for nid in pending:
-                    # After applying the prev tree at depth 0, the client's tree-count
-                    # equals k (trees 0..k-1 folded in).  Before that application
-                    # (i.e. just before depth 0 runs) its count is still k-1.
-                    # The server checks the *last reported* count to decide whether a
-                    # full-forest resync is necessary.
-                    expected = (k - 1) if depth == 0 else k
-                    resync = 0 if declared.get(nid, -99) == expected else 1
+                    # Depth 0: always resync — send the full forest so the client
+                    # resets and applies exactly the k completed trees (0..k-1).
+                    # This guarantees trees_seen == k == tree_index regardless of
+                    # any prior state drift.
+                    # Depth > 0: the client's state is already correct from depth 0;
+                    # only force a resync if its reported tree-count drifted.
+                    if depth == 0:
+                        resync = 1
+                    else:
+                        resync = 0 if declared.get(nid, -99) == k else 1
                     arrays: dict = {}
                     arrays.update(gbdt.pack_trees([tree], "tree"))
-                    # Only send the previous completed tree at depth 0, where the
-                    # client needs to fold it into its running predictions.  At deeper
-                    # levels the client already applied it, so sending it again would
-                    # cause a double-apply and permanently desync the tree count.
-                    if depth == 0:
-                        arrays.update(gbdt.pack_trees([prev] if prev else [], "prev"))
-                    else:
-                        arrays.update(gbdt.pack_trees([], "prev"))
+                    # prev is no longer sent — at depth 0 the full forest already
+                    # contains every completed tree, and at depth > 0 the client's
+                    # running score is already up to date.
+                    arrays.update(gbdt.pack_trees([], "prev"))
                     arrays["frontier"] = np.asarray(frontier, dtype=np.int32)
                     if resync:
                         arrays.update(gbdt.pack_trees(forest.trees, "forest"))
