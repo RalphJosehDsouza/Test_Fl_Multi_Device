@@ -1,0 +1,93 @@
+{
+  "config": {
+    "num_trees": 4,
+    "max_depth": 4,
+    "learning_rate": 0.2,
+    "lambda_l2": 1.0,
+    "min_child_samples": 50,
+    "total_bins": 226,
+    "aggregation": "sum"
+  },
+  "pos_weight": 3.000014,
+  "nodes": {
+    "0": {
+      "hostname": "DESKTOP-JTBEKAR",
+      "partition_id": 0,
+      "rows": 150345,
+      "n_pos": 37606,
+      "n_neg": 112739
+    },
+    "1": {
+      "hostname": "DESKTOP-JTBEKAR",
+      "partition_id": 1,
+      "rows": 132444,
+      "n_pos": 33091,
+      "n_neg": 99353
+    }
+  },
+  "federation_rounds": 34,
+  "client_recoveries": 14,
+  "client_floats_total": 160008,
+  "client_megabytes_total": 1.2801,
+  "seconds": 22.2,
+  "seconds_per_tree": 5.55,
+  "evaluations": [],
+  "trees": [
+    {
+      "tree": 1,
+      "nodes": 29,
+      "participants": [
+        0,
+        1
+      ],
+      "hostnames": [
+        "DESKTOP-JTBEKAR"
+      ],
+      "client_loss": 0.693147,
+      "evaluation": null,
+      "seconds": 3.387
+    },
+    {
+      "tree": 2,
+      "nodes": 29,
+      "participants": [
+        0,
+        1
+      ],
+      "hostnames": [
+        "DESKTOP-JTBEKAR"
+      ],
+      "client_loss": 0.607165,
+      "evaluation": null,
+      "seconds": 5.725
+    },
+    {
+      "tree": 3,
+      "nodes": 29,
+      "participants": [
+        0,
+        1
+      ],
+      "hostnames": [
+        "DESKTOP-JTBEKAR"
+      ],
+      "client_loss": 0.551558,
+      "evaluation": null,
+      "seconds": 6.091
+    },
+    {
+      "tree": 4,
+      "nodes": 31,
+      "participants": [
+        0,
+        1
+      ],
+      "hostnames": [
+        "DESKTOP-JTBEKAR"
+      ],
+      "client_loss": 0.509376,
+      "evaluation": null,
+      "seconds": 6.44
+    }
+  ]
+}

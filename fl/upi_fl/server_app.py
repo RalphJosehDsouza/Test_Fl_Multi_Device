@@ -13,6 +13,17 @@ than a single number.
 
 Every reply carries the client's hostname, so ``reports/fl/fl_rounds.json`` records which
 machines actually contributed to each round.
+
+Staying in step
+---------------
+Growing one tree is a sequence of depth-by-depth rounds, and the clients carry the model
+between rounds (see ``client_app`` for why). The server is authoritative about that state:
+each round states the number of finished trees every client must hold (``expected-trees``)
+and either hands over the single tree that just closed or the whole forest. A reply is only
+usable when the client confirms that same count; otherwise the node is reported as
+``NO_REPLY`` (transport) or ``REPLY_REJECTED_DUE_TO_SYNC`` (it answered and refused), the
+round is retried with the full forest, and a client that still disagrees fails the run loudly
+with those numbers rather than silently averaging over fewer machines.
 """
 
 from __future__ import annotations
@@ -38,7 +49,12 @@ from upi_fl import bins, gbdt, metrics, paths, server_core
 app = ServerApp()
 
 W = 78
-RESYNC_ATTEMPTS = 3
+# How many exchanges one round may take. Each attempt is strictly more authoritative than
+# the last (a plain resend, then a full rebuild), so the budget is exactly what the three
+# possible cases need: a normal round, one retry after a client goes silent, and one rebuild
+# for a client that admits it is out of step. Nothing here can repeat itself, so the run can
+# never spend its time re-sending a payload that was already refused.
+SYNC_ATTEMPTS = 3
 
 
 def rule(char: str = "-") -> None:
@@ -135,6 +151,11 @@ def main(grid: Grid, context: Context) -> None:
                        "n_neg": int(mr["n-neg"])}
     if not roster:
         raise RuntimeError("no client answered the hello round - is any SuperNode connected?")
+    if len(roster) < len(node_ids):
+        print(f"  WARNING: {len(node_ids) - len(roster)} of {len(node_ids)} connected node(s) "
+              f"failed the hello round and will not contribute", flush=True)
+        print("           check each SuperNode's --node-config data-path: it must point at "
+              "that machine's own shard", flush=True)
 
     n_pos = sum(v["n_pos"] for v in roster.values())
     n_neg = sum(v["n_neg"] for v in roster.values())
@@ -164,6 +185,10 @@ def main(grid: Grid, context: Context) -> None:
 
     declared: dict[int, int] = {}
     rounds = 0
+    # Rounds that needed more than one exchange because a node came back short. On a real
+    # federation this is where a dropped reply or a client that starts from scratch on every
+    # message shows up, so the run reports the count instead of hiding it.
+    recoveries = 0
     total_floats = 0
     trees_log: list[dict] = []
     evaluations: list[dict] = []
@@ -176,16 +201,35 @@ def main(grid: Grid, context: Context) -> None:
     for k in range(num_trees):
         t_tree = time.perf_counter()
         tree = gbdt.Tree(params["max_depth"])
-        prev = forest.trees[-1] if forest.trees else None
         tree_losses: list[tuple[int, float]] = []
         participants: set[int] = set()
 
-        def fetch_level(frontier, depth, k=k, tree=tree, prev=prev):
-            nonlocal rounds, total_floats
+        def fetch_level(frontier, depth, k=k, tree=tree):
+            """One server<->client round, at one depth of one tree.
+
+            The server is authoritative: before a client may answer it must be holding
+            exactly ``k`` finished trees, and the server says so in the request. The first
+            exchange picks the cheapest instruction that gets a healthy client there,
+            derived from the tree-count it last reported (``declared``):
+
+                in step (k)          nothing to apply - just answer
+                one behind (k - 1)   hand over the single tree that just closed
+                anything else        rebuild: the whole forest 0..k-1
+
+            A round that comes back short is retried with the one instruction that cannot
+            be misapplied - the full rebuild - whatever the reason was. A client that went
+            silent, restarted mid-run or drifted therefore always lands on the same state,
+            and no attempt ever repeats a payload a client has already refused. The tree
+            being grown travels under a separate key and is never folded in as state,
+            which is what used to leave the two sides exactly one tree apart.
+            """
+            nonlocal rounds, total_floats, recoveries
             per_client: list[dict] = []
             answered: set[int] = set()       # nodes that already returned valid histograms
+            status: dict[int, str] = {}      # why each node did (or did not) contribute
+            forest_trees = forest.trees      # the authoritative state: trees 0..k-1
 
-            for _attempt in range(RESYNC_ATTEMPTS):
+            for attempt in range(SYNC_ATTEMPTS):
                 # Only (re-)query nodes that haven't provided valid data yet.
                 pending = sorted(nid for nid in roster if nid not in answered)
                 if not pending:
@@ -193,43 +237,46 @@ def main(grid: Grid, context: Context) -> None:
 
                 messages = []
                 for nid in pending:
-                    # Depth 0: always resync — send the full forest so the client
-                    # resets and applies exactly the k completed trees (0..k-1).
-                    # This guarantees trees_seen == k == tree_index regardless of
-                    # any prior state drift.
-                    # Depth > 0: the client's state is already correct from depth 0;
-                    # only force a resync if its reported tree-count drifted.
-                    if depth == 0:
-                        resync = 1
+                    last = declared.get(nid)          # tree-count this node last reported
+                    if attempt or last is None or last not in (k, k - 1) \
+                            or (last == k - 1 and k == 0):
+                        # Never heard from it, it drifted, or the cheap send already
+                        # failed: rebuild rather than guess.
+                        resync, prev_trees = 1, []
+                    elif last == k:
+                        resync, prev_trees = 0, []                      # already in step
                     else:
-                        resync = 0 if declared.get(nid, -99) == k else 1
+                        resync, prev_trees = 0, [forest_trees[k - 1]]   # one tree behind
                     arrays: dict = {}
                     arrays.update(gbdt.pack_trees([tree], "tree"))
-                    # prev is no longer sent — at depth 0 the full forest already
-                    # contains every completed tree, and at depth > 0 the client's
-                    # running score is already up to date.
-                    arrays.update(gbdt.pack_trees([], "prev"))
+                    arrays.update(gbdt.pack_trees(prev_trees, "prev"))
+                    arrays.update(gbdt.pack_trees(forest_trees if resync else [], "forest"))
                     arrays["frontier"] = np.asarray(frontier, dtype=np.int32)
-                    if resync:
-                        arrays.update(gbdt.pack_trees(forest.trees, "forest"))
                     messages.append(build_message(
                         grid, nid, f"tree-{k}-depth-{depth}",
                         {"op": "hist", "tree-index": k, "level": depth, "resync": resync,
-                         "pos-weight": float(pos_weight), "base-score": float(base_score)},
+                         "expected-trees": k, "pos-weight": float(pos_weight),
+                         "base-score": float(base_score)},
                         arrays))
                 replies = list(grid.send_and_receive(messages))
                 rounds += 1
-                resync_asked: list[int] = []
                 for reply in replies:
                     src = reply.metadata.src_node_id
                     if reply.has_error() or not reply.has_content():
-                        print(f"    node {src}: {reply.error}", flush=True)
+                        # NO_REPLY: nothing came back, or it came back broken.
+                        status[src] = f"NO_REPLY ({reply.error})"
                         continue
                     mr = reply.content["metrics"]
                     declared[src] = int(mr["tree-count"])
                     if int(mr.get("need-resync", 0)):
-                        resync_asked.append(src)
+                        # REPLY_REJECTED_DUE_TO_SYNC: the client is alive, it answered,
+                        # and it refused to train on the state it was handed.
+                        got, want = int(mr["tree-count"]), int(mr.get("expected-trees", k))
+                        status[src] = (f"REPLY_REJECTED_DUE_TO_SYNC (client tree-count "
+                                       f"{got}, server expected {want})")
                         continue
+                    # VALID_HISTOGRAM: real statistics from a client that is in step.
+                    status[src] = "VALID_HISTOGRAM"
                     participants.add(src)
                     answered.add(src)
                     buf = _unpack_arrays(reply.content["arrays"])["hist"]
@@ -239,13 +286,36 @@ def main(grid: Grid, context: Context) -> None:
                     if depth == 0 and not tree_losses:
                         tree_losses.append((int(mr["num-examples"]),
                                             float(mr["loss"])))
-                if not resync_asked:
+                short = [nid for nid in pending if nid not in answered]
+                if not short:
                     break
-                print(f"    node(s) {resync_asked} out of sync - resending the forest",
+                detail = "\n".join(f"      node {nid}: {status.get(nid, 'NO_REPLY')}"
+                                   for nid in short)
+                if attempt + 1 >= SYNC_ATTEMPTS:
+                    # A rebuild went out and still disagreed: report the real numbers
+                    # instead of pretending the client sent nothing.
+                    raise RuntimeError(
+                        f"tree {k} level {depth}: client state still disagrees after a "
+                        f"full rebuild - stopping rather than looping.\n"
+                        f"    server state: tree {k}, depth {depth}, every client must "
+                        f"hold {k} tree(s)\n{detail}")
+                print(f"    tree {k} level {depth}: node(s) {short} - sending the "
+                      f"authoritative forest (attempt {attempt + 2} of {SYNC_ATTEMPTS})",
                       flush=True)
+                # Say *why* each node came back short. NO_REPLY means nothing arrived (a
+                # dropped or unreadable reply); a rejected tree-count means the node answered
+                # and disagreed about the state it held. Those need different fixes, so the
+                # reason is printed rather than left to be guessed from the round count.
+                print(detail, flush=True)
+                recoveries += 1
+
             if not per_client:
-                raise RuntimeError(f"tree {k} level {depth}: no client returned statistics"
-                                   f" after {RESYNC_ATTEMPTS} resync attempt(s)")
+                detail = "\n".join(f"      node {nid}: {status.get(nid, 'NO_REPLY')}"
+                                   for nid in sorted(roster))
+                raise RuntimeError(
+                    f"tree {k} level {depth}: no usable client statistics.\n"
+                    f"    server state: tree {k}, depth {depth}, every client must "
+                    f"hold {k} tree(s)\n{detail}")
             return server_core.sum_histograms(per_client, frontier, schema["total_bins"])
 
         gains = gbdt.grow_tree(schema, params, tree, fetch_level)
@@ -293,6 +363,7 @@ def main(grid: Grid, context: Context) -> None:
         "pos_weight": round(pos_weight, 6),
         "nodes": {str(k2): v for k2, v in roster.items()},
         "federation_rounds": rounds,
+        "client_recoveries": recoveries,
         "client_floats_total": total_floats,
         "client_megabytes_total": round(total_floats * 8 / 1e6, 4),
         "seconds": round(seconds, 2),
@@ -308,6 +379,9 @@ def main(grid: Grid, context: Context) -> None:
     rule("=")
     print(f"  {len(forest.trees)} trees, {rounds} federation rounds, {seconds:.1f}s"
           f"  ({seconds / max(len(forest.trees), 1):.2f}s per tree)")
+    if recoveries:
+        print(f"  {recoveries} round(s) needed a second exchange - a node came back short "
+              f"and was rebuilt from the authoritative forest (see the reasons above)")
     print(f"  client -> server traffic: {total_floats * 8 / 1e6:.3f} MB total, "
           f"{total_floats * 8 / 1e6 / max(rounds, 1):.4f} MB per round across all clients")
     hosts: set[str] = set()

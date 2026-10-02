@@ -38,14 +38,19 @@ def _candidates(value: str, default: Path | None):
 
 def resolve_path(value: str, default: Path | None = None, must_exist: bool = True,
                  what: str = "file") -> Path:
-    for candidate in _candidates(value, default):
+    candidates = _candidates(value, default)
+    for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
     if must_exist:
-        where = f" (tried {len(_candidates(value, default))} locations)"
+        tried = "\n".join(f"      {c}" for c in candidates)
         raise FileNotFoundError(
-            f"could not find the {what} '{value or default}'{where}.\n"
-            f"Pass an absolute path, e.g.  --run-config \"{what}-path=/abs/path/to/{Path(value or '.').name}\""
+            f"could not find the {what} '{value or default}'.\n"
+            f"    this app is running from {Path.cwd()}, so these were tried:\n{tried}\n"
+            f"    pass an absolute path, e.g.\n"
+            f"      --run-config \"{what}-path=/abs/path/to/{Path(value or '.').name}\"\n"
+            f"    or, for a SuperNode, --node-config \"{what}-path=/abs/path/to/"
+            f"{Path(value or '.').name}\""
         )
     return Path.cwd() / value
 
