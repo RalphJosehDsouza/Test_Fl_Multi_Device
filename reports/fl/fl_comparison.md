@@ -1,5 +1,11 @@
 # Federated GBDT vs Centralised Baseline — Comparison Report
 
+> Historical results: these federated metrics and the saved simulation model predate
+> the correction to repeated feature totals in split and leaf calculations. Retrain
+> and regenerate the comparison before using them as evidence for the corrected code.
+> Federated-versus-pooled agreement alone did not detect the error because both paths
+> used the same tree-building code. The separate Phase I LightGBM is unaffected by this fix.
+
 ## Summary
 
 | Metric | Federated GBDT | Phase I LightGBM | Delta |

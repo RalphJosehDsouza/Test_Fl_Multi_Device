@@ -320,6 +320,12 @@ def leaf_value(G: float, H: float, params: dict) -> float:
     return -float(G) / (float(H) + params["lambda_l2"]) * params["learning_rate"]
 
 
+def node_totals(G: np.ndarray, H: np.ndarray, C: np.ndarray, schema: dict):
+    """Each feature covers all rows; use one feature to count each row once."""
+    off, size = schema["offsets"][0], schema["bin_counts"][0]
+    return tuple(float(a[off:off + size].sum()) for a in (G, H, C))
+
+
 def best_split(G: np.ndarray, H: np.ndarray, C: np.ndarray, schema: dict, params: dict):
     """Best (feature, bin threshold) for one node, or None if nothing beats the gain floor.
 
@@ -328,7 +334,7 @@ def best_split(G: np.ndarray, H: np.ndarray, C: np.ndarray, schema: dict, params
     """
     lam = params["lambda_l2"]
     min_child = params["min_child_samples"]
-    Gt, Ht, Ct = float(G.sum()), float(H.sum()), float(C.sum())
+    Gt, Ht, Ct = node_totals(G, H, C, schema)
     if Ct < 2 * min_child or Ht <= EPS:
         return None
     parent = Gt * Gt / (Ht + lam)
@@ -372,12 +378,13 @@ def grow_tree(schema: dict, params: dict, tree: Tree, fetch) -> list[tuple[int, 
         next_frontier: list[int] = []
         for nid in frontier:
             G, H, C = stats[nid]
+            Gt, Ht, _ = node_totals(G, H, C, schema)
             if depth == tree.max_depth:
-                tree.set_leaf(nid, leaf_value(G.sum(), H.sum(), params))
+                tree.set_leaf(nid, leaf_value(Gt, Ht, params))
                 continue
             best = best_split(G, H, C, schema, params)
             if best is None:
-                tree.set_leaf(nid, leaf_value(G.sum(), H.sum(), params))
+                tree.set_leaf(nid, leaf_value(Gt, Ht, params))
                 continue
             j, t, gain = best
             gains.append((j, gain))

@@ -47,7 +47,7 @@ amount-bins = 64
 hour-bins = 24
 
 # --- tree growth, mirroring src/modeling.py PARAMS -------------------------------------
-# lr=0.2 with 60 trees reaches ROC-AUC 0.9114 ≈ baseline 0.9115 (see simulation.json).
+# Re-evaluate these settings after the histogram-total correction; old metrics are historical.
 learning-rate = 0.2
 lambda-l2 = 1.0
 min-child-samples = 50
