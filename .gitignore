@@ -24,6 +24,7 @@ Thumbs.db
 # Run artefacts
 *.log
 reports/train_log.txt
+reports/fl/smoke/
 
 # Tracked deliberately, not ignored:
 #   models/          ~48 KB, the exact models behind the reported metrics

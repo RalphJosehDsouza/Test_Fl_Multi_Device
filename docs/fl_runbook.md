@@ -20,6 +20,18 @@ client 1 needs `client_1.csv`. This checkout currently has only `client_1.csv`.
 
 ## Start the server on Windows A
 
+If the other laptops are unavailable, first check the real runtime locally:
+
+```text
+python fl/smoke_test.py
+```
+
+This launches one SuperLink and two SuperNodes on loopback ports, using synthetic
+fixtures and a separate Flower configuration. It trains three trees, checks both
+clients contributed, and stops the processes it started. Logs, fixtures and model
+outputs remain in a unique folder under `reports/fl/smoke/` (ignored by Git).
+This checks local deployment, not communication between physical laptops.
+
 ```text
 flower-superlink --insecure --fleet-api-address 0.0.0.0:9092 --disable-runtime-dependency-installation
 ```
