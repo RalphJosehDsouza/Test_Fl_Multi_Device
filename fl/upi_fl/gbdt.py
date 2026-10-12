@@ -31,6 +31,7 @@ tractable. Tree count and depth are config, not assumptions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -166,6 +167,15 @@ def pack_trees(trees, key: str = "tree") -> dict:
         out[f"{key}_{name}"] = np.concatenate(
             [np.asarray(getattr(t, name)) for t in trees]).astype(dtype)
     return out
+
+
+def tree_checksum(tree) -> np.ndarray:
+    """Fingerprint structure and leaf values, including trees with equal leaf sums."""
+    digest = hashlib.sha256()
+    for name in TREE_FIELDS:
+        dtype = "<f8" if name == "value" else "<i4"
+        digest.update(np.asarray(getattr(tree, name), dtype=dtype).tobytes())
+    return np.frombuffer(digest.digest(), dtype=np.uint8).copy()
 
 
 def unpack_trees(record, key: str) -> list[Tree]:

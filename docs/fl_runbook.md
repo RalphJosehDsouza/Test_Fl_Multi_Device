@@ -1,199 +1,126 @@
-# Federated Learning Runbook — Multi-Device Deployment
+# Federated learning across three laptops
 
-This runbook covers three deployment modes for the UPI fraud detection federated GBDT,
-from simplest to production-like.
+This procedure targets Flower 1.39.0: Windows laptop A is the server,
+Windows laptop B is client 0, and the Mac is client 1. Two clients train;
+the server coordinates them. Keep each client's CSV on its own laptop.
 
----
+## Environment
 
-## Prerequisites
+Use Python 3.11 or 3.12 in an activated virtual environment on every laptop.
+From the repository root, install the training runtime:
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| Python | ≥ 3.10 | Same on all machines |
-| Flower | 1.39.0 | `pip install -r requirements-fl.txt` |
-| Dataset | `data/processed/upi_transactions_engineered.csv` | Only needed on the partitioning machine |
-
-```bash
-# On every machine
-pip install -r requirements-fl.txt
-
-# On the machine that creates the partitions
-python fl/make_partitions.py --clients 3
+```text
+python -m pip install -r requirements-fl.txt "flwr==1.39.0"
 ```
 
----
+On macOS, use `python3` if that is your environment's Python command.
+The existing partition summary describes two shards. Do not regenerate them
+unless deliberately replacing the experiment. Client 0 needs `client_0.csv`;
+client 1 needs `client_1.csv`. This checkout currently has only `client_1.csv`.
 
-## Mode 1: In-Process Simulation (1 machine)
+## Start the server on Windows A
 
-No network, no Flower server process. Tests the algorithm in isolation.
-
-```bash
-# Quick sanity check (aggregation invariant only)
-python fl/simulate.py --check-only
-
-# Full training run
-python fl/simulate.py --trees 60 --learning-rate 0.2 --save
-
-# Compare with baseline
-python fl/compare.py
+```text
+flower-superlink --insecure --fleet-api-address 0.0.0.0:9092 --disable-runtime-dependency-installation
 ```
 
-**What to check:**
-- `max |pooled − sum of clients|` should be ≤ 1e-6
-- `federated vs pooled max probability difference` should be ≤ 1e-12
-- `reports/fl/simulation.json` has the run details
+Run this in the environment where requirements-fl.txt was installed. The flag
+keeps the server using that prepared environment. This is an unencrypted lab
+setup; TLS, authentication, secure aggregation and DP remain separate work.
+Allow the two client laptops to reach TCP port 9092 on the server's private LAN.
 
----
+## Connect the two clients
 
-## Mode 2: Localhost (1 machine, separate processes)
+Replace `SERVER_LAN_IP` and the example paths. Use absolute paths with forward
+slashes on Windows. TOML string values inside node-config need quotes.
 
-Real Flower runtime with server and clients as separate processes on the same machine.
+Windows B, PowerShell (one line):
 
-### Step 1: Start the Flower SuperLink (server runtime)
-
-```bash
-# Terminal 1
-flwr server --insecure
+```powershell
+flower-supernode --insecure --superlink SERVER_LAN_IP:9092 --node-config "partition-id=0 num-partitions=2 data-path='C:/upi-data/client_0.csv'"
 ```
 
-### Step 2: Start SuperNodes (client runtimes)
-
-Open 3 more terminals, one per client:
+Mac, Terminal (one line):
 
 ```bash
-# Terminal 2 — client 0
-flwr client --insecure --superlink 127.0.0.1:9092 \
-  --node-config "partition-id=0 data-path=data/fl/client_0.csv num-partitions=3"
-
-# Terminal 3 — client 1
-flwr client --insecure --superlink 127.0.0.1:9092 \
-  --node-config "partition-id=1 data-path=data/fl/client_1.csv num-partitions=3"
-
-# Terminal 4 — client 2
-flwr client --insecure --superlink 127.0.0.1:9092 \
-  --node-config "partition-id=2 data-path=data/fl/client_2.csv num-partitions=3"
+flower-supernode --insecure --superlink SERVER_LAN_IP:9092 --node-config "partition-id=1 num-partitions=2 data-path='/Users/yourname/upi-data/client_1.csv'"
 ```
 
-### Step 3: Run the federated app
+Wait for both nodes to connect. Duplicate partition IDs are rejected. A run
+also fails if fewer than two clients are connected when it starts.
 
-```bash
-# Terminal 5, from the fl/ directory
-cd fl
-flwr run . local-simulation   # OR: the federation target matching localhost
+## Submit training and display server logs
+
+On Windows A, run `flwr config list` to locate Flower's config.toml. Add:
+
+```toml
+[superlink.upi-lan]
+address = "127.0.0.1:8000"
+insecure = true
 ```
 
-### Step 4: Verify
+Create a run override TOML file on the server, for example `lan-run.toml`,
+using the server's actual repository path:
 
-```bash
-# Check the round log
-python -c "import json; d=json.load(open('reports/fl/fl_rounds.json')); print('hosts:', {h for t in d['trees'] for h in t['hostnames']})"
-
-# Compare
-python fl/compare.py --model models/fl/global_final.json
+```toml
+num-trees = 3
+min-clients = 2
+forest-every-level = 1
+eval-every-trees = 0
+out-dir = 'C:/path/to/Test_Fl_Multi_Device'
 ```
 
----
+From the repository root, submit the smoke run:
 
-## Mode 3: Multi-Device (3 machines on the same network)
-
-This is the deployment mode that demonstrates Objective 4 end-to-end.
-
-### Network Layout
-
-| Role | Machine | IP (example) | What it runs |
-|------|---------|-------------|-------------|
-| Server | A | 192.168.1.100 | SuperLink + ServerApp |
-| Client 0 | B | 192.168.1.101 | SuperNode + ClientApp |
-| Client 1 | C | 192.168.1.102 | SuperNode + ClientApp |
-| Client 2 | A or B | (same) | Can double up on any machine |
-
-### Step 1: Prepare data on each client machine
-
-Copy the client's own shard to each machine. **Do not** copy other clients' data.
-
-```bash
-# On machine B
-scp user@A:~/BE_Major_Project/data/fl/client_0.csv data/fl/client_0.csv
-
-# On machine C
-scp user@A:~/BE_Major_Project/data/fl/client_1.csv data/fl/client_1.csv
+```text
+flwr run fl upi-lan --stream --run-config lan-run.toml
 ```
 
-### Step 2: Start the SuperLink on machine A
+`--stream` displays ServerApp output. The default `flwr run .` connection can
+launch a local simulation instead of using your laptops. Use the named
+`upi-lan` connection explicitly. The old `flwr server` and `flwr client`
+commands are not valid in Flower 1.39.
 
-```bash
-# Machine A
-flwr server --insecure
+After the smoke run succeeds, set num-trees to 60. To evaluate during training,
+set eval-every-trees to 10 and server-test-path to the absolute path of the
+held-out server_test.csv. Never use a client training shard as the test set.
+
+## What the demo should show
+
+- `[send]`: target hostname, depth and whether the completed forest was sent.
+- `[receive]`: client partition, synchronized tree count and histogram bytes.
+- `[aggregate]`: all contributing node IDs and the histogram sum operation.
+- `[model]`: the new tree's node count and leaf values.
+
+Clients compute gradient, Hessian and count histograms locally. The server sums
+those statistics and constructs the global tree; it does not average neural
+network weights. The last tree is saved on the server; deployment of the final
+model to a POS inference service is a later milestone.
+
+A restarted ClientApp recovers its score from the supplied forest. If a client
+fails to contribute after three attempts, training aborts rather than using a
+partial aggregate. Already accepted replies are not counted twice.
+
+## Evidence and checks
+
+After successful completion, inspect these files under out-dir:
+
+- models/fl/global_final.json: completed global model.
+- reports/fl/fl_rounds.json: participating hostnames, partition IDs and tree log.
+
+For this setup, every completed tree should show the Windows B and Mac client
+hostnames. Hostnames are client-reported evidence, not authenticated identities.
+Save the streamed terminal output with the demo evidence. Histogram byte counts
+exclude transport overhead and server-to-client traffic.
+
+Run the protocol regression suite from the repository root:
+
+```text
+python -m unittest discover -s tests -v
 ```
 
-The SuperLink listens on port `9092` by default.
+These tests use real Flower message objects with an in-memory transport. They
+cover restarts, resync, duplicate replies, node/run isolation and missing
+participants. They do not prove network connectivity or execution on the Mac.
 
-### Step 3: Start SuperNodes on machines B and C
-
-```bash
-# Machine B
-flwr client --insecure --superlink 192.168.1.100:9092 \
-  --node-config "partition-id=0 data-path=/path/to/client_0.csv num-partitions=3"
-
-# Machine C
-flwr client --insecure --superlink 192.168.1.100:9092 \
-  --node-config "partition-id=1 data-path=/path/to/client_1.csv num-partitions=3"
-```
-
-Replace `192.168.1.100` with machine A's actual IP.
-
-### Step 4: Run the federated app from machine A
-
-```bash
-cd fl
-flwr run . --run-config "server-test-path=/abs/path/to/data/fl/server_test.csv"
-```
-
-### Step 5: Verify multi-device participation
-
-```bash
-python -c "
-import json
-d = json.load(open('reports/fl/fl_rounds.json'))
-hosts = {h for t in d['trees'] for h in t['hostnames']}
-print(f'Machines that contributed: {sorted(hosts)}')
-print(f'Trees: {len(d[\"trees\"])}, Rounds: {d[\"federation_rounds\"]}')
-for node_id, info in d['nodes'].items():
-    print(f'  Node {node_id}: {info[\"hostname\"]} partition {info[\"partition_id\"]} ({info[\"rows\"]:,} rows)')
-"
-```
-
-**The round log must show B's and C's hostnames** — this is the evidence for Objective 4.
-
----
-
-## Troubleshooting
-
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| `no client answered the hello round` | SuperNodes not connected | Check firewall, IP, port 9092 |
-| `could not find the schema` | Working directory wrong | Pass absolute `--run-config "schema-path=/abs/path/to/schema.json"` |
-| `node out of sync - resending forest` | Client restarted mid-run | Normal — the resync protocol handles this automatically |
-| ROC-AUC much lower than expected | Too few trees | Increase `num-trees` in pyproject.toml or `--run-config "num-trees=60"` |
-
----
-
-## Configuration Reference
-
-All parameters are in `fl/pyproject.toml` under `[tool.flwr.app.config]` and can be
-overridden per run:
-
-```bash
-flwr run . --run-config "num-trees=60 learning-rate=0.2 max-depth=4"
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num-trees` | 60 | Number of boosting rounds |
-| `max-depth` | 4 | Maximum tree depth |
-| `learning-rate` | 0.2 | Shrinkage per tree |
-| `lambda-l2` | 1.0 | L2 regularisation |
-| `min-child-samples` | 50 | Minimum samples per leaf |
-| `eval-every-trees` | 10 | Server-side scoring interval (0 = off) |
-| `server-test-path` | `data/fl/server_test.csv` | Labelled test set for server scoring |
-| `aggregation` | `sum` | Aggregation mode (Obj 6 adds `secure-agg`) |
+Command reference: [Flower 1.39 deployment guide](https://flower.ai/docs/framework/1.39/en/how-to-run-flower-with-deployment-engine.html).

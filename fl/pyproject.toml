@@ -40,6 +40,7 @@ clientapp = "upi_fl.client_app:app"
 # run length and the communication overhead reported for Objective 5.
 num-trees = 60
 max-depth = 4
+min-clients = 2
 
 # --- binning: fixed in advance, so no client data influences it ------------------------
 amount-bins = 64
@@ -55,6 +56,9 @@ min-split-gain = 1e-6
 # --- server-side monitoring ------------------------------------------------------------
 eval-every-trees = 10
 server-test-path = "data/fl/server_test.csv"
+# Where the server writes the global model and the run log. Empty means "find the repo root
+# from the working directory"; set it explicitly when the app runs from a temp directory.
+out-dir = ""
 
 # --- aggregation -----------------------------------------------------------------------
 # "sum" is the plain federated sum of leaf statistics required by Objective 5.
@@ -62,6 +66,10 @@ server-test-path = "data/fl/server_test.csv"
 # work leaves untouched. The wire format already carries the additive quantities those
 # mechanisms need, so they can be added without redesigning anything here.
 aggregation = "sum"
+
+# Include completed trees at every level for clients restarted between messages.
+# Set to 0 to save download traffic; restarted clients then need a resync exchange.
+forest-every-level = 1
 
 # ---- federations: how `flwr run` launches the app ------------------------------------
 

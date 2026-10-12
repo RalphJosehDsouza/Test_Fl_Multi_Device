@@ -99,6 +99,7 @@ def main(grid: Grid, context: Context) -> None:
               "min_split_gain": float(rc.get("min-split-gain", 1e-6))}
     num_trees = int(rc["num-trees"])
     eval_every = int(rc.get("eval-every-trees", 0))
+    forest_every_level = int(rc.get("forest-every-level", 1))
     base_score = 0.0
 
     out_dir = paths.resolve_out_dir(str(rc.get("out-dir", "")))
@@ -108,6 +109,10 @@ def main(grid: Grid, context: Context) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     node_ids = sorted(grid.get_node_ids())
+    min_clients = int(rc.get("min-clients", 2))
+    if len(node_ids) < min_clients:
+        raise RuntimeError(f"expected at least {min_clients} clients, found {len(node_ids)}; "
+                           "connect the SuperNodes before submitting the run")
     rule("=")
     print(" FEDERATED GBDT - SERVER".center(W))
     print(f" {len(node_ids)} client node(s) in the federation".center(W))
@@ -135,6 +140,11 @@ def main(grid: Grid, context: Context) -> None:
                        "n_neg": int(mr["n-neg"])}
     if not roster:
         raise RuntimeError("no client answered the hello round - is any SuperNode connected?")
+    if len(roster) != len(node_ids):
+        raise RuntimeError("not all connected clients answered hello; check client logs")
+    partitions = [v["partition_id"] for v in roster.values()]
+    if len(set(partitions)) != len(partitions):
+        raise RuntimeError("duplicate partition-id: each client must use a distinct shard")
 
     n_pos = sum(v["n_pos"] for v in roster.values())
     n_neg = sum(v["n_neg"] for v in roster.values())
@@ -176,11 +186,10 @@ def main(grid: Grid, context: Context) -> None:
     for k in range(num_trees):
         t_tree = time.perf_counter()
         tree = gbdt.Tree(params["max_depth"])
-        prev = forest.trees[-1] if forest.trees else None
         tree_losses: list[tuple[int, float]] = []
         participants: set[int] = set()
 
-        def fetch_level(frontier, depth, k=k, tree=tree, prev=prev):
+        def fetch_level(frontier, depth, k=k, tree=tree):
             nonlocal rounds, total_floats
             per_client: list[dict] = []
             answered: set[int] = set()       # nodes that already returned valid histograms
@@ -193,25 +202,21 @@ def main(grid: Grid, context: Context) -> None:
 
                 messages = []
                 for nid in pending:
-                    # Depth 0: always resync — send the full forest so the client
-                    # resets and applies exactly the k completed trees (0..k-1).
-                    # This guarantees trees_seen == k == tree_index regardless of
-                    # any prior state drift.
-                    # Depth > 0: the client's state is already correct from depth 0;
-                    # only force a resync if its reported tree-count drifted.
-                    if depth == 0:
-                        resync = 1
-                    else:
-                        resync = 0 if declared.get(nid, -99) == k else 1
+                    # Depth zero always carries the forest, including an empty one.
+                    # Later levels can recover clients whose process has restarted.
+                    expected = (k - 1) if depth == 0 else k
+                    resync = 1 if declared.get(nid, -99) != expected else 0
                     arrays: dict = {}
                     arrays.update(gbdt.pack_trees([tree], "tree"))
-                    # prev is no longer sent — at depth 0 the full forest already
-                    # contains every completed tree, and at depth > 0 the client's
-                    # running score is already up to date.
-                    arrays.update(gbdt.pack_trees([], "prev"))
                     arrays["frontier"] = np.asarray(frontier, dtype=np.int32)
-                    if resync:
+                    if forest_every_level or depth == 0 or resync:
                         arrays.update(gbdt.pack_trees(forest.trees, "forest"))
+                        arrays["forest_tree_ck"] = np.asarray(
+                            [gbdt.tree_checksum(t) for t in forest.trees], dtype=np.uint8)
+                    print(f"  [send] tree={k + 1} depth={depth} node={nid} "
+                          f"host={roster[nid]['hostname']} "
+                          f"completed-trees={len(forest.trees)} "
+                          f"forest-attached={'forest_starts' in arrays}", flush=True)
                     messages.append(build_message(
                         grid, nid, f"tree-{k}-depth-{depth}",
                         {"op": "hist", "tree-index": k, "level": depth, "resync": resync,
@@ -222,6 +227,8 @@ def main(grid: Grid, context: Context) -> None:
                 resync_asked: list[int] = []
                 for reply in replies:
                     src = reply.metadata.src_node_id
+                    if src not in pending or src in answered:
+                        continue
                     if reply.has_error() or not reply.has_content():
                         print(f"    node {src}: {reply.error}", flush=True)
                         continue
@@ -230,28 +237,43 @@ def main(grid: Grid, context: Context) -> None:
                     if int(mr.get("need-resync", 0)):
                         resync_asked.append(src)
                         continue
+                    buf = _unpack_arrays(reply.content["arrays"])["hist"]
+                    if (buf.ndim != 1 or buf.size != len(frontier) * 3 * schema["total_bins"]
+                            or not np.isfinite(buf).all()):
+                        raise RuntimeError(f"node {src}: invalid histogram payload")
                     participants.add(src)
                     answered.add(src)
-                    buf = _unpack_arrays(reply.content["arrays"])["hist"]
                     total_floats += int(buf.size)
+                    print(f"  [receive] tree={k + 1} depth={depth} node={src} "
+                          f"partition={roster[src]['partition_id']} "
+                          f"trees-seen={mr['tree-count']} histogram-bytes={buf.nbytes}",
+                          flush=True)
                     per_client.append(gbdt.unpack_histograms(buf, frontier,
                                                              schema["total_bins"]))
-                    if depth == 0 and not tree_losses:
+                    if depth == 0:
                         tree_losses.append((int(mr["num-examples"]),
                                             float(mr["loss"])))
-                if not resync_asked:
+                if len(answered) == len(roster):
                     break
-                print(f"    node(s) {resync_asked} out of sync - resending the forest",
-                      flush=True)
-            if not per_client:
-                raise RuntimeError(f"tree {k} level {depth}: no client returned statistics"
-                                   f" after {RESYNC_ATTEMPTS} resync attempt(s)")
+                if resync_asked:
+                    print(f"    node(s) {resync_asked} out of sync - resending the forest",
+                          flush=True)
+            missing = sorted(set(roster) - answered)
+            if missing:
+                raise RuntimeError(f"tree {k} level {depth}: missing clients {missing}"
+                                   f" after {RESYNC_ATTEMPTS} attempts; refusing partial aggregation")
+            print(f"  [aggregate] tree={k + 1} depth={depth} "
+                  f"clients={sorted(answered)} frontier={list(frontier)} "
+                  "operation=sum(gradient,hessian,count)", flush=True)
             return server_core.sum_histograms(per_client, frontier, schema["total_bins"])
 
         gains = gbdt.grow_tree(schema, params, tree, fetch_level)
         for j, gain in gains:
             forest.gain[j] += gain
         forest.add_tree(tree)
+        print(f"  [model] completed-trees={len(forest.trees)} "
+              f"nodes={tree.n_nodes} leaf-values="
+              f"{[round(v, 6) for v in tree.value if np.isfinite(v)]}", flush=True)
 
         weight = sum(n for n, _ in tree_losses)
         loss = sum(n * v for n, v in tree_losses) / weight if weight else float("nan")

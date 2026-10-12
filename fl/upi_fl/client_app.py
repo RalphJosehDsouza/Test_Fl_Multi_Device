@@ -13,10 +13,9 @@ Protocol (the server drives; see ``server_app`` for the other half)
 
 State across messages
 ---------------------
-A client keeps its shard and its running score, so the server only ever sends the tree that
-just closed rather than the whole model. If the two ever disagree about how many trees the
-client has folded in, the client answers ``need-resync`` and the server resends the forest -
-so a client that restarts mid-run rejoins instead of silently training on a stale model.
+A process may be restarted between any two messages. The server supplies completed trees
+at every level by default; the client rebuilds its score or applies only new trees when
+its cached fingerprints agree. A cache is scoped to one run and one node.
 """
 
 from __future__ import annotations
@@ -39,13 +38,14 @@ from upi_fl import bins, gbdt, paths, task
 
 app = ClientApp()
 
-# One instance serves every message of a run, so the shard is read and binned once. The
-# cache is module level so it also survives the instance being recreated between messages.
+# Optional process-local cache; correctness must not depend on its survival.
 _STATE: dict = {}
 
 
 def _state(context: Context) -> dict:
-    if _STATE:
+    identity = (context.run_id, context.node_id, dict(context.node_config),
+                dict(context.run_config))
+    if _STATE.get("identity") == identity:
         return _STATE
     schema = bins.load_schema(
         paths.resolve_path(context.run_config.get("schema-path", ""),
@@ -53,8 +53,10 @@ def _state(context: Context) -> dict:
                            what="schema"))
     partition_id = int(context.node_config.get("partition-id", 0))
     data_path = context.node_config.get("data-path", "") or f"data/fl/client_{partition_id}.csv"
-    shard = task.load_shard(paths.resolve_path(data_path, what="data"), schema)
-    _STATE.update(schema=schema, shard=shard, partition_id=partition_id,
+    shard = task.load_shard(paths.resolve_path(data_path, what="data"), schema,
+                            use_cache=False)
+    _STATE.clear()
+    _STATE.update(identity=identity, schema=schema, shard=shard, partition_id=partition_id,
                   num_partitions=int(context.node_config.get("num-partitions", 1)))
     return _STATE
 
@@ -113,22 +115,32 @@ def train(msg: Message, context: Context) -> Message:
     # --- one round of growing the current tree -----------------------------------------
     tree_index = int(cfg["tree-index"])
     base_score = float(cfg["base-score"])
-
-    # Unpack the arrays from the incoming message
     incoming = _unpack_arrays(msg.content["arrays"])
 
-    if int(cfg["resync"]):
-        task.reset(shard, base_score)
-        for t in gbdt.unpack_trees(incoming, "forest"):
+    # The forest is authoritative. Reuse scores only when both the base score and
+    # completed tree fingerprints match; a restarted process rebuilds them.
+    if "forest_starts" in incoming:
+        forest = gbdt.unpack_trees(incoming, "forest")
+        if len(forest) != tree_index:
+            raise ValueError("forest length does not match tree-index")
+        checksums = np.asarray(incoming["forest_tree_ck"], dtype=np.uint8)
+        mine = state.get("forest_ck", np.zeros((0, 32), dtype=np.uint8))
+        already = shard.trees_seen
+        consistent = (state.get("base_score") == base_score
+                      and already <= len(forest) and len(mine) >= already
+                      and bool(np.array_equal(mine[:already], checksums[:already])))
+        if not consistent:
+            task.reset(shard, base_score)
+            already = 0
+        for t in forest[already:]:
             task.apply_tree(shard, t)
-    else:
-        # Only the first level of a tree carries it, and on a resync the forest already
-        # contains it, so the two branches are exclusive.
-        for t in gbdt.unpack_trees(incoming, "prev"):
-            task.apply_tree(shard, t)
+        state["forest_ck"] = checksums
+        state["base_score"] = base_score
 
     configs, mets = _base_reply_data(shard, state)
     if shard.trees_seen != tree_index:
+        # No forest in this message and the counts disagree, so the client cannot repair
+        # itself. Say so instead of answering with statistics from the wrong gradients.
         mets["need-resync"] = 1
         return _reply(msg, configs=configs, metrics=mets)
 
